@@ -1,0 +1,17 @@
+.git
+.github
+.codex-worklog
+.zig-cache
+zig-out
+!zig-out/
+!zig-out/bin/
+!zig-out/bin/tf-dsv41-assets
+!zig-out/bin/tf-dsv41-token-map
+!zig-out/bin/tf-dsv41-engram-pack
+build
+dist
+models
+assets
+*.log
+__pycache__
+*.pyc

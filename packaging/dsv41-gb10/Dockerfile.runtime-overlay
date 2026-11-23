@@ -1,0 +1,20 @@
+ARG BASE_IMAGE=tensorfold-dsv41:v1.2.1-sm121
+FROM ${BASE_IMAGE}
+
+COPY zig-out/bin/tf-dsv41-assets /usr/local/bin/tf-dsv41-assets
+COPY zig-out/bin/tf-dsv41-token-map /usr/local/bin/tf-dsv41-token-map
+COPY zig-out/bin/tf-dsv41-engram-pack /usr/local/bin/tf-dsv41-engram-pack
+COPY packaging/dsv41-gb10/entrypoint.sh /usr/local/bin/tensorfold-entrypoint
+COPY packaging/dsv41-gb10/healthcheck.sh /usr/local/bin/tensorfold-healthcheck
+COPY packaging/dsv41-gb10/preflight.sh /usr/local/bin/tensorfold-preflight
+
+RUN chmod 0755 \
+        /usr/local/bin/tf-dsv41-assets \
+        /usr/local/bin/tf-dsv41-token-map \
+        /usr/local/bin/tf-dsv41-engram-pack \
+        /usr/local/bin/tensorfold-entrypoint \
+        /usr/local/bin/tensorfold-healthcheck \
+        /usr/local/bin/tensorfold-preflight
+
+ENV TF_DSV41_ENGRAM_DIR=/engram
+VOLUME ["/models", "/assets", "/engram", "/var/lib/tensorfold"]

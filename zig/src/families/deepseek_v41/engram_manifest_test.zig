@@ -36,12 +36,12 @@ fn packRelease(a: std.mem.Allocator, io: std.Io, src: []const u8, out: std.Io.Di
     var plans: std.ArrayList(ep.Plan) = .empty;
     defer plans.deinit(a);
     for (layers) |l| {
-        _ = try ep.pack(a, io, &p, out, l, 77, null);
+        _ = try ep.pack(a, io, &p, out, l, .{}, 77, null);
         try plans.append(a, try ep.tableOf(&p, l));
     }
     const out_dir = try out.realPathFileAlloc(io, ".", a);
     defer a.free(out_dir);
-    const m = try em.Manifest.build(a, io, out_dir, &p, plans.items, seed);
+    const m = try em.Manifest.build(a, io, out_dir, &p, plans.items, .{}, seed);
     defer m.deinit();
     try m.write(a, io, out_dir);
 }
@@ -154,7 +154,7 @@ test "engram manifest: the manifest path rebuilds for existing tables and the bo
     defer a.free(odir);
     // the packed tables already exist; drop the manifest the packer wrote and rebuild it from the shards
     try out.dir.deleteFile(io, em.filename);
-    const mr = try em.manifestFor(a, io, sdir, odir, 11);
+    const mr = try em.manifestFor(a, io, sdir, odir, .{}, 11);
     try t.expect(mr.tables == 2);
     const ck = try em.check(a, io, sdir, odir, false);
     try t.expect(ck.samples > 0);
@@ -194,7 +194,7 @@ test "engram manifest: a flipped table byte makes the manifest path refuse and w
     _ = try f.readPositionalAll(io, &b, at);
     b[0] +%= 1;
     try f.writePositionalAll(io, &b, at);
-    try t.expectError(error.EngramSampleMismatch, em.manifestFor(a, io, sdir, odir, 11));
+    try t.expectError(error.EngramSampleMismatch, em.manifestFor(a, io, sdir, odir, .{}, 11));
     // the refusal wrote nothing: still no manifest, and no temp file left behind
     const mpath = try std.fs.path.join(a, &.{ odir, em.filename });
     defer a.free(mpath);

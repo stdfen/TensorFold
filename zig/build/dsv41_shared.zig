@@ -24,6 +24,11 @@ pub fn steps(b: *std.Build) void {
         run.has_side_effects = true;
     }
     b.step("test-dsv41-shared", "Shared DeepSeek checkpoint host tests, no GPU dependencies").dependOn(&run.step);
+    const pack_tests = b.addRunArtifact(b.addTest(.{
+        .root_module = module(b, b.graph.host, "shared_test.zig"),
+        .filters = &.{ "engram pack:", "engram manifest:" },
+    }));
+    b.step("test-dsv41-engram-pack", "Engram shard packing and manifest tests without native AIO").dependOn(&pack_tests.step);
     const linux_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
     const cross = b.addTest(.{ .root_module = module(b, linux_target, "shared_test.zig") });
     _ = cross.getEmittedBin();

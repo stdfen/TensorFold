@@ -3,6 +3,7 @@ const std = @import("std");
 const t = std.testing;
 const er = @import("engram_rows.zig");
 const ep = @import("engram_pack.zig");
+const eh = @import("engram_hash.zig");
 const pk = @import("pack.zig");
 
 const rows = 300;
@@ -43,11 +44,11 @@ test "engram pack: the shard is the header then each row's 256 codes and 8 scale
     defer a.free(layers);
     try t.expectEqualSlices(u32, &.{ 1, 14 }, layers);
     // 300 rows in chunks of 77 (a short last chunk) and in one chunk
-    try t.expectEqual(@as(u64, rows), try ep.pack(a, io, &p, out.dir, 1, 77, null));
-    try t.expectEqual(@as(u64, rows), try ep.pack(a, io, &p, out.dir, 14, 1 << 20, null));
+    try t.expectEqual(@as(u64, rows), try ep.pack(a, io, &p, out.dir, 1, .{}, 77, null));
+    try t.expectEqual(@as(u64, rows), try ep.pack(a, io, &p, out.dir, 14, .{}, 1 << 20, null));
     for (layers) |l| {
         var nb: [64]u8 = undefined;
-        const bytes = try out.dir.readFileAlloc(io, try ep.shardName(&nb, l), a, .limited(1 << 24));
+        const bytes = try out.dir.readFileAlloc(io, try ep.shardName(&nb, l, .{}), a, .limited(1 << 24));
         defer a.free(bytes);
         const h = try er.Header.parse(bytes[0..48], bytes.len);
         try t.expectEqual(@as(u64, rows), h.hi);
@@ -67,7 +68,7 @@ test "engram pack: the shard is the header then each row's 256 codes and 8 scale
     try t.expectError(error.FileNotFound, out.dir.access(io, "engram-l1-r0of1.bin.part", .{}));
     const odir = try out.dir.realPathFileAlloc(io, ".", a);
     defer a.free(odir);
-    const good = try ep.verify(a, io, &p, odir, layers, 64, 3);
+    const good = try ep.verify(a, io, &p, odir, layers, .{}, 64, 3);
     try t.expectEqual(@as(u64, 0), good.bad);
     try t.expectEqual(@as(u64, 2 * 66), good.rows);
     // every row of a table with one byte flipped in row 123's scales: exactly that row differs
@@ -78,7 +79,50 @@ test "engram pack: the shard is the header then each row's 256 codes and 8 scale
     _ = try f.readPositionalAll(io, &b, at);
     b[0] +%= 1;
     try f.writePositionalAll(io, &b, at);
-    const bad = try ep.verify(a, io, &p, odir, layers, rows, 3);
+    const bad = try ep.verify(a, io, &p, odir, layers, .{}, rows, 3);
     try t.expectEqual(@as(u64, 2 * rows), bad.rows);
     try t.expectEqual(@as(u64, 1), bad.bad);
+}
+
+test "engram pack: shard ranges follow runtime hash-column ownership" {
+    const expected = [_][2][2]u64{
+        .{ .{ 0, 192_001_740 }, .{ 192_001_740, 384_006_168 } },
+        .{ .{ 0, 192_007_016 }, .{ 192_007_016, 384_016_682 } },
+    };
+    for (eh.layers, 0..) |meta, li| {
+        var previous: u64 = 0;
+        for (0..2) |rank| {
+            const shard = ep.Shard{ .rank = @intCast(rank), .world = 2 };
+            const range = try shard.range(meta.layer_id, meta.rows);
+            try t.expectEqual(expected[li][rank][0], range.lo);
+            try t.expectEqual(expected[li][rank][1], range.hi);
+            try t.expectEqual(previous, range.lo);
+            previous = range.hi;
+            const col_lo = rank * 12;
+            const col_hi = col_lo + 12;
+            for (col_lo..col_hi) |col| {
+                try t.expect(meta.offsets[col] >= range.lo);
+                try t.expect(@as(u64, meta.offsets[col]) + meta.primes[col] <= range.hi);
+            }
+        }
+        try t.expectEqual(@as(u64, meta.rows), previous);
+    }
+}
+
+test "engram pack: real hashes never escape the owning TP2 shard" {
+    const tokens = [_]u32{ 7, 101, 990, 12_345 };
+    for (eh.layers) |meta| {
+        var ids: [eh.columns]u32 = undefined;
+        eh.hashValues(&tokens, &meta.multipliers, &meta.primes, &meta.offsets, eh.heads, &ids);
+        for (0..2) |rank| {
+            const range = try (ep.Shard{ .rank = @intCast(rank), .world = 2 }).range(meta.layer_id, meta.rows);
+            for (ids[rank * 12 ..][0..12]) |id| try t.expect(id >= range.lo and id < range.hi);
+        }
+    }
+}
+
+test "engram pack: canonical layer rows are enforced" {
+    try t.expectError(error.InvalidEngramTable, (ep.Shard{ .rank = 0, .world = 2 }).range(1, rows));
+    try t.expectError(error.InvalidEngramTable, (ep.Shard{ .rank = 0, .world = 2 }).range(99, 1));
+    try t.expectError(error.InvalidEngramShard, (ep.Shard{ .rank = 0, .world = eh.columns + 1 }).range(1, eh.layers[0].rows));
 }

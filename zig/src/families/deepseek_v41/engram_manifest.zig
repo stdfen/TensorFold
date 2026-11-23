@@ -50,7 +50,8 @@ pub const Manifest = struct {
     tables: []const Table = &.{},
 
     /// The packer's manifest for `plans`, in ascending layer order; the shards in `tables_dir` must already be written.
-    pub fn build(a: Allocator, io: Io, tables_dir: []const u8, p: *const Pack, plans: []const Plan, seed: u64) !Manifest {
+    pub fn build(a: Allocator, io: Io, tables_dir: []const u8, p: *const Pack, plans: []const Plan, shard: ep.Shard, seed: u64) !Manifest {
+        try shard.validate();
         const arena_p = try a.create(std.heap.ArenaAllocator);
         errdefer a.destroy(arena_p);
         arena_p.* = std.heap.ArenaAllocator.init(a);
@@ -77,14 +78,15 @@ pub const Manifest = struct {
                 });
             }
             var tnb: [64]u8 = undefined;
-            const tname = try ep.shardName(&tnb, t.layer);
+            const range = try shard.range(t.layer, t.rows);
+            const tname = try ep.shardName(&tnb, t.layer, shard);
             var spb: [512]u8 = undefined;
             const spath = try std.fmt.bufPrint(&spb, "{s}/{s}", .{ tables_dir, tname });
             try tabs.append(al, Table{
                 .layer = t.layer,
                 .file = try al.dupe(u8, tname),
-                .lo = 0,
-                .hi = t.rows,
+                .lo = range.lo,
+                .hi = range.hi,
                 .total = t.rows,
                 .size = try fileLength(io, spath),
                 .sha = try fileSha256(io, spath),
@@ -261,7 +263,8 @@ pub fn check(a: Allocator, io: Io, release_dir: []const u8, tables_dir: []const 
 pub const ManifestResult = struct { tables: u64, samples: u64 };
 
 /// The manifest for tables that already exist: shard headers, release tensors, a seeded sample; the rows proved first.
-pub fn manifestFor(a: Allocator, io: Io, release_dir: []const u8, tables_dir: []const u8, seed: u64) !ManifestResult {
+pub fn manifestFor(a: Allocator, io: Io, release_dir: []const u8, tables_dir: []const u8, shard: ep.Shard, seed: u64) !ManifestResult {
+    try shard.validate();
     var dir = std.Io.Dir.cwd().openDir(io, tables_dir, .{ .iterate = true }) catch return error.EngramManifestMissing;
     defer dir.close(io);
     var names: std.ArrayList([]const u8) = .empty;
@@ -310,7 +313,9 @@ pub fn manifestFor(a: Allocator, io: Io, release_dir: []const u8, tables_dir: []
             });
         }
         var tb: [64]u8 = undefined;
-        const tname = try ep.shardName(&tb, @intCast(h.layer));
+        const expected = try shard.range(@intCast(h.layer), h.total);
+        if (h.lo != expected.lo or h.hi != expected.hi) return error.EngramShardCorrupt;
+        const tname = try ep.shardName(&tb, @intCast(h.layer), shard);
         if (!std.mem.eql(u8, n, tname)) return error.EngramShardCorrupt;
         try tabs.append(al, Table{
             .layer = @intCast(h.layer),
@@ -365,7 +370,7 @@ fn checkText(a: Allocator, io: Io, release_dir: []const u8, tables_dir: []const 
         for (m.samples) |x| {
             if (x < h.lo or x >= h.hi) continue;
             var row: [er.row_bytes]u8 = undefined;
-            if (try f.readPositionalAll(io, &row, er.header_bytes + x * er.row_bytes) != er.row_bytes) return error.EngramShardCorrupt;
+            if (try f.readPositionalAll(io, &row, er.header_bytes + (x - h.lo) * er.row_bytes) != er.row_bytes) return error.EngramShardCorrupt;
             var wrow: [er.values]u8 = undefined;
             var srow: [8]u8 = undefined;
             try pack.read(io, wi, .{ .offset = x * er.values, .len = er.values }, &wrow);
