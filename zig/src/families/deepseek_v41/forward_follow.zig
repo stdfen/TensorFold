@@ -84,6 +84,8 @@ pub const op_grammar: i64 = 28;
 /// 64: [op] every rank syncs its device and reads its clock; 65: [op, n] samples all-gathered (ops 64-67: calib)
 pub const op_calib_mark: i64 = 64;
 pub const op_calib_gather: i64 = 65;
+/// 68: [op, row0, rows, k] diagnostic teacher-forced top-k capture on every rank.
+pub const op_capture_topk: i64 = 68;
 
 /// A timed run's start or end on every rank: the leader sends the mark, then this rank syncs and reads its clock.
 pub fn calibMark(f: *Forward) !u64 {
@@ -274,6 +276,14 @@ fn followOp(f: *Forward, msg: []const i64, ids: *std.ArrayList(u32), prompt: *st
         op_calib_gather => {
             if (msg.len != 2 or msg[1] < 0) return error.BadPlan;
             try f.followCalib(@intCast(msg[1]));
+        },
+        op_capture_topk => {
+            if (msg.len != 4 or msg[1] < 0 or msg[2] <= 0 or msg[3] < 2) return error.BadPlan;
+            const rows: usize = @intCast(msg[2]);
+            const k: usize = @intCast(msg[3]);
+            const out = try f.gpa.alloc(@import("native_logits.zig").Candidate, rows * k);
+            defer f.gpa.free(out);
+            try f.captureTopK(@intCast(msg[1]), rows, k, out);
         },
         op_stop => return true,
         op_sess_save => {

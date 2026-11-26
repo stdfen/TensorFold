@@ -7,9 +7,11 @@ const hooks = @import("forward_hooks.zig");
 const ph = @import("phases.zig");
 const fwd = @import("forward.zig");
 const fwd_follow = @import("forward_follow.zig");
+const native_logits = @import("native_logits.zig");
 const Forward = fwd.Forward;
 const kops = fwd.kops;
 const op_greedy = fwd_follow.op_greedy;
+const op_capture_topk = fwd_follow.op_capture_topk;
 
 /// Greedy choices of the last window's rows: each rank's max (lowest column), all-gathered (lower rank wins).
 pub fn greedy(f: *Forward, out: []u32) !void {
@@ -116,4 +118,46 @@ pub fn greedyScratch(f: *Forward, r: *run.Runner, n: usize) !u64 {
         f.greedy_dev = try cuda.DeviceBuffer.alloc(r.d, @max(bytes, 4096));
     }
     return f.greedy_dev.?.ptr;
+}
+
+/// Capture deterministic global top-k logits allocation-heavy; normal greedy is unchanged and `out` is rows*k.
+pub fn captureTopK(f: *Forward, row0: usize, rows: usize, k: usize, out: []native_logits.Candidate) !void {
+    if (rows == 0 or k < 2 or out.len != rows * k) return error.Shape;
+    if (f.leads()) try f.link.?.send(&.{ op_capture_topk, @intCast(row0), @intCast(rows), @intCast(k) });
+    const r = f.runner;
+    const world = f.comm.world();
+    const rank = f.comm.rank();
+    const part = try @import("partition.zig").share(f.cfg.vocab, rank, world);
+    if (k > part.len) return error.Shape;
+    const local_n = rows * k;
+
+    var local_values = try cuda.DeviceBuffer.alloc(r.d, 4 * local_n);
+    defer local_values.free();
+    var local_columns = try cuda.DeviceBuffer.alloc(r.d, 8 * local_n);
+    defer local_columns.free();
+    var all_values = try cuda.DeviceBuffer.alloc(r.d, 4 * local_n * world);
+    defer all_values.free();
+    var all_columns = try cuda.DeviceBuffer.alloc(r.d, 8 * local_n * world);
+    defer all_columns.free();
+
+    const available: usize = if (f.slot.pending) |p| p.n else f.last_rows;
+    if (row0 + rows > available) return error.Shape;
+    const logits = (r.addressOf("w.logits") orelse return error.Unbound) + 4 * row0 * part.len;
+    if (f.grammar) |g| try g.apply(g.ptr, @intCast(row0), @intCast(rows));
+    try r.kernels.others(r.stream).topKeys(logits, part.len, rows, part.len, k, local_values.ptr, local_columns.ptr);
+    try f.comm.allGather(local_values.ptr, all_values.ptr, local_n, .f32, r.stream.handle);
+    try f.comm.allGather(local_columns.ptr, all_columns.ptr, local_n, .i64, r.stream.handle);
+
+    const values = try f.gpa.alloc(f32, local_n * world);
+    defer f.gpa.free(values);
+    const columns = try f.gpa.alloc(i64, local_n * world);
+    defer f.gpa.free(columns);
+    try all_values.downloadAsync(0, std.mem.sliceAsBytes(values), r.stream.handle);
+    try all_columns.downloadAsync(0, std.mem.sliceAsBytes(columns), r.stream.handle);
+    try r.stream.synchronize();
+
+    const offsets = try f.gpa.alloc(u32, world);
+    defer f.gpa.free(offsets);
+    for (offsets, 0..) |*offset, i| offset.* = @intCast((try @import("partition.zig").share(f.cfg.vocab, i, world)).lo);
+    try native_logits.merge(out, values, columns, offsets, rows, k);
 }

@@ -20,7 +20,7 @@ const Allocator = std.mem.Allocator;
 const sched_host = @import("sched_host.zig");
 
 pub const backends: []const []const u8 = &.{"cuda"};
-pub const families: []const api.Family = &.{.{ .model_type = "deepseek_v41", .formats = &.{"exl3"}, .raw_text = false }};
+pub const families: []const api.Family = &.{.{ .model_type = "deepseek_v41", .formats = &.{ "exl3", "official_mixed" }, .raw_text = false }};
 
 pub fn chip(_: Allocator) ?[]const u8 {
     return null;
@@ -75,7 +75,14 @@ pub const Served = struct {
 
     /// Rank 0's engine over a loaded model (`drafts`: DSpark's pass, else serial windows through the same lanes).
     pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64) !*Served {
-        const m = try model.Model.open(gpa, io, dir, assets, .{ .drafts = drafts, .own_prefill = model.ownPrefillEnv(), .layers = try model.layersEnv(gpa) });
+        const native_official = model.nativeOfficialEnv();
+        if (native_official and drafts) return error.NativeOfficialDraftsDisabled;
+        const m = try model.Model.open(gpa, io, dir, assets, .{
+            .drafts = drafts,
+            .own_prefill = model.ownPrefillEnv(),
+            .layers = try model.layersEnv(gpa),
+            .native_official = native_official,
+        });
         errdefer m.close();
         if (m.rank() != 0) return error.NotRankZero; // the other ranks run `tf-dsv41 follow`
         const s = try gpa.create(Served);

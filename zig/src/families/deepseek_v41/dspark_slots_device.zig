@@ -447,7 +447,7 @@ pub fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!vo
         const n: usize = numel(c.args[2].arg.t);
         const vocab_part = try @import("partition.zig").share(x.f.cfg.vocab, comm.rank(), Wd);
         const V: usize = vocab_part.len;
-        const embed = r.weights.get("embed") orelse return error.MissingWeight;
+        const embed = r.weightView("embed") orelse return error.MissingWeight;
         const rws = try x.device(&x.send, 2 * n * D);
         try k.embedSend(try r.tensorAddr(c.args[2].arg.t), n, embed.ptr, @intCast(vocab_part.lo), V, D, rws);
         const recv = try r.tensorAddr(c.args[1].arg.t);

@@ -30,6 +30,9 @@ const usage =
     \\usage: tf-dsv41 replay|forward|both PACK CAPTURE OUT
     \\       tf-dsv41 check CAPTURE   (host only: block.zig's calls against the capture's launches)
     \\       tf-dsv41 plan            (host only: the whole model emitted from the K2 width listings, its buffer plan)
+    \\       tf-dsv41 inspect-native MODEL
+    \\       tf-dsv41 plan-native MODEL --world N [--json OUT]
+    \\       tf-dsv41 native-capture MODEL ASSETS REQUEST OUT (official TP4 teacher-forced top-k JSON)
     \\       tf-dsv41 kv-emit CAPTURE (host only: the pool / split programs' invariants for every captured window)
     \\       tf-dsv41 engram-probe DIR RANK WORLD (the Engram read path on a node's shards: device latency at depth
     \\                   1 / 8 / 32 / 64, the serving pool's batch times, idle and with spinning cores; no GPU)
@@ -53,6 +56,22 @@ const usage =
 
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len == 3 and std.mem.eql(u8, args[1], "inspect-native"))
+        return nativeCheckpoint(init, args[2], 1, "inspect-native", null);
+    if (args.len == 5 and std.mem.eql(u8, args[1], "plan-native") and std.mem.eql(u8, args[3], "--world")) {
+        const world = std.fmt.parseInt(u32, args[4], 10) catch return 2;
+        return nativeCheckpoint(init, args[2], world, "plan-native", null);
+    }
+    if (args.len == 7 and std.mem.eql(u8, args[1], "plan-native") and std.mem.eql(u8, args[3], "--world") and std.mem.eql(u8, args[5], "--json")) {
+        const world = std.fmt.parseInt(u32, args[4], 10) catch return 2;
+        return nativeCheckpoint(init, args[2], world, "plan-native", args[6]);
+    }
+    if (args.len == 6 and std.mem.eql(u8, args[1], "native-capture")) {
+        return @import("gate_native_capture.zig").main(init.gpa, init.io, args[2], args[3], args[4], args[5]) catch |e| {
+            std.debug.print("FAIL tf-dsv41 native-capture: {t}\n", .{e});
+            return 1;
+        };
+    }
     if (args.len == 5 and std.mem.eql(u8, args[1], "decode-tp")) {
         return @import("gate_decode_tp.zig").main(init.gpa, init.io, args[2], args[3], args[4]) catch |e| {
             std.debug.print("FAIL tf-dsv41 decode-tp: {t}\n", .{e});
@@ -175,6 +194,32 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("FAIL tf-dsv41: {t}\n", .{e});
         return 1;
     };
+}
+
+fn nativeCheckpoint(init: std.process.Init, dir: []const u8, world: u32, command: []const u8, json_path: ?[]const u8) u8 {
+    var buf: [4096]u8 = undefined;
+    var out = std.Io.File.stdout().writer(init.io, &buf);
+    const native = @import("native_checkpoint.zig");
+    native.inspect(init.gpa, init.io, dir, world, &out.interface) catch |err| {
+        std.debug.print("FAIL tf-dsv41 {s}: {t}\n", .{ command, err });
+        return 1;
+    };
+    out.interface.flush() catch return 1;
+    if (json_path) |path| {
+        var file = std.Io.Dir.cwd().createFile(init.io, path, .{}) catch |err| {
+            std.debug.print("FAIL tf-dsv41 {s} --json: {t}\n", .{ command, err });
+            return 1;
+        };
+        defer file.close(init.io);
+        var json_buf: [64 << 10]u8 = undefined;
+        var json_out = file.writerStreaming(init.io, &json_buf);
+        native.writeJson(init.gpa, init.io, dir, world, &json_out.interface) catch |err| {
+            std.debug.print("FAIL tf-dsv41 {s} --json: {t}\n", .{ command, err });
+            return 1;
+        };
+        json_out.interface.flush() catch return 1;
+    }
+    return 0;
 }
 
 /// The captured blocks' layer indices (meta.json "sets"), ascending.

@@ -91,7 +91,7 @@ pub const GpuPass = struct {
         errdefer if (!assembled) {
             if (conf) |c| gpa.free(c);
         };
-        if (r.weights.get("dspark.conf")) |t| {
+        if (r.weightView("dspark.conf")) |t| {
             conf = try gpa.alloc(f32, t.len / 4);
         }
         const st: emit.Statics = .{ .n = n, .window = cfg.window };
@@ -205,7 +205,7 @@ pub const GpuPass = struct {
     }
 
     fn fetch(r: *run.Runner, name: []const u8, out: []u8) !void {
-        const t = r.weights.get(name) orelse return error.NoWeight;
+        const t = r.weightView(name) orelse return error.NoWeight;
         if (t.len < out.len) return error.NoWeight;
         try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = t.ptr, .len = out.len }, 0, out);
     }

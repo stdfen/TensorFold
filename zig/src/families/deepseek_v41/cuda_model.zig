@@ -11,6 +11,7 @@ const Pack = @import("pack.zig").Pack;
 const plan = @import("plan.zig");
 const named = @import("named.zig");
 const load = @import("cuda_weights.zig");
+const native_resident = @import("native_resident.zig");
 const prepared = @import("prepared.zig");
 const buffers = @import("buffers.zig");
 const forms = @import("forms.zig");
@@ -51,7 +52,14 @@ pub const Options = struct {
     own_prefill: bool = true,
     /// the backbone layers to load and run (null: all; a gate runs a reference's prefix, e.g. 0-24)
     layers: ?[]const u32 = null,
+    /// Direct official safetensors, text-only TP4, lossless mixed formats.
+    native_official: bool = false,
 };
+
+pub fn nativeOfficialEnv() bool {
+    const value = std.c.getenv("TF_DSV41_NATIVE_OFFICIAL") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, std.mem.span(value), " \t"), "1");
+}
 
 /// TF_DSV41_LAYERS=<lo>-<hi>: load and run only that backbone prefix (a reference prefix's model; null: every layer)
 pub fn layersEnv(gpa: std.mem.Allocator) !?[]const u32 {
@@ -97,6 +105,7 @@ pub const Model = struct {
     pack: Pack,
     pl: plan.Plan,
     weights: load.Weights,
+    native: ?native_resident.Resident = null,
     aot: cuda.aot.Set,
     widths: @import("block.zig").Widths,
     runner: run.Runner,
@@ -147,6 +156,7 @@ pub const Model = struct {
         m.retained_next = null;
         m.retained = false;
         m.boot_complete = false;
+        m.native = null;
         m.io = io;
         m.progress = .{ .io = io };
         const stall_ns = try @import("round_progress.zig").timeoutNs(if (std.c.getenv("TF_DSV41_STALL_EXIT_S")) |v| std.mem.span(v) else null);
@@ -231,76 +241,98 @@ pub const Model = struct {
         };
         var ds: [8]u32 = undefined;
         const blocks = if (o.drafts) try std.mem.concat(a, u32, &.{ backbone, dspark_emit.blocks(&m.cfg, &ds) }) else backbone;
-        m.pl = try plan.build(gpa, &m.cfg, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .blocks = blocks, .top = true, .dspark = o.drafts });
-        try load.admitPlan(io, &m.cfg, &m.pack, &m.pl);
-        m.weights = .{ .gpa = gpa, .digest = false }; // no weights check reads the digests here (load.zig)
-        // TF_DSV41_PREPARED (prepared.zig): each layer's host images read back instead of rebuilt from the pack
-        var cache = try prepared.Cache.fromEnv(gpa, io, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .o_groups = m.cfg.o_groups, .blocks = blocks, .dspark = o.drafts });
-        defer if (cache) |*c| c.deinit();
-        var t_build: i96 = 0;
-        var t_upload: i96 = 0;
-        const t_load = std.Io.Clock.awake.now(io).toNanoseconds();
-        for (m.pl.layers, 0..) |*l, i| {
-            var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack };
-            defer b.deinit();
-            var tag_buf: [16]u8 = undefined;
-            const tag = try std.fmt.bufPrint(&tag_buf, "L{d}", .{i});
-            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
-            var schema: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack, .metadata_only = true };
-            defer schema.deinit();
-            if (cache != null) try schema.layer(l, m.cfg.o_groups, m.tcfg.rank, world);
-            if (cache == null or !try cache.?.get(&b, tag, schema.out.items)) {
-                try b.layer(l, m.cfg.o_groups, m.tcfg.rank, world);
-                if (cache) |*c| c.put(&b, tag) catch |e| if (!quiet) std.log.warn("dsv41 prepared: {s} not written ({t})", .{ tag, e });
+        if (o.native_official and (world != 4 or o.drafts or blocks.len != m.cfg.layers))
+            return error.NativeOfficialNeedsTextOnlyTP4;
+        if (o.native_official) {
+            m.pl = .{
+                .arena = std.heap.ArenaAllocator.init(gpa),
+                .rank = m.tcfg.rank,
+                .world = world,
+                .layers = &.{},
+                .top = &.{},
+                .head = null,
+                .dspark = null,
+                .leftovers = &.{},
+            };
+            m.weights = .{ .gpa = gpa, .digest = false };
+            m.native = try native_resident.Resident.open(gpa, io, &m.driver, pack_dir, m.tcfg.rank, &m.cfg);
+            std.log.info("dsv41 native official: rank {d}/4 loaded {d:.3} GiB losslessly", .{
+                m.tcfg.rank,
+                @as(f64, @floatFromInt(m.native.?.weights.bytes)) / (1 << 30),
+            });
+        } else {
+            m.pl = try plan.build(gpa, &m.cfg, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .blocks = blocks, .top = true, .dspark = o.drafts });
+            try load.admitPlan(io, &m.cfg, &m.pack, &m.pl);
+            m.weights = .{ .gpa = gpa, .digest = false }; // no weights check reads the digests here (load.zig)
+            // TF_DSV41_PREPARED (prepared.zig): each layer's host images read back instead of rebuilt from the pack
+            var cache = try prepared.Cache.fromEnv(gpa, io, &m.pack, .{ .rank = m.tcfg.rank, .world = world, .o_groups = m.cfg.o_groups, .blocks = blocks, .dspark = o.drafts });
+            defer if (cache) |*c| c.deinit();
+            var t_build: i96 = 0;
+            var t_upload: i96 = 0;
+            const t_load = std.Io.Clock.awake.now(io).toNanoseconds();
+            for (m.pl.layers, 0..) |*l, i| {
+                var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack };
+                defer b.deinit();
+                var tag_buf: [16]u8 = undefined;
+                const tag = try std.fmt.bufPrint(&tag_buf, "L{d}", .{i});
+                const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+                var schema: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack, .metadata_only = true };
+                defer schema.deinit();
+                if (cache != null) try schema.layer(l, m.cfg.o_groups, m.tcfg.rank, world);
+                if (cache == null or !try cache.?.get(&b, tag, schema.out.items)) {
+                    try b.layer(l, m.cfg.o_groups, m.tcfg.rank, world);
+                    if (cache) |*c| c.put(&b, tag) catch |e| if (!quiet) std.log.warn("dsv41 prepared: {s} not written ({t})", .{ tag, e });
+                }
+                const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
+                // the next prepared file read ahead by the kernel while this layer uploads
+                if (cache) |*c| {
+                    var next_buf: [16]u8 = undefined;
+                    c.willNeed(if (i + 1 < m.pl.layers.len) std.fmt.bufPrint(&next_buf, "L{d}", .{i + 1}) catch "" else "top");
+                }
+                try m.weights.upload(&m.driver, &b);
+                t_build += t1 - t0;
+                t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;
             }
-            const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
-            // the next prepared file read ahead by the kernel while this layer uploads
-            if (cache) |*c| {
-                var next_buf: [16]u8 = undefined;
-                c.willNeed(if (i + 1 < m.pl.layers.len) std.fmt.bufPrint(&next_buf, "L{d}", .{i + 1}) catch "" else "top");
+            {
+                var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack };
+                defer b.deinit();
+                const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+                var schema: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack, .metadata_only = true };
+                defer schema.deinit();
+                if (cache != null) {
+                    try schema.top(&m.pl);
+                    try schema.dspark(&m.pl);
+                }
+                if (cache == null or !try cache.?.get(&b, "top", schema.out.items)) {
+                    try b.top(&m.pl);
+                    try b.dspark(&m.pl);
+                    if (cache) |*c| c.put(&b, "top") catch |e| if (!quiet) std.log.warn("dsv41 prepared: top not written ({t})", .{e});
+                }
+                const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
+                try m.weights.upload(&m.driver, &b);
+                t_build += t1 - t0;
+                t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;
             }
-            try m.weights.upload(&m.driver, &b);
-            t_build += t1 - t0;
-            t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;
-        }
-        {
-            var b: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack };
-            defer b.deinit();
-            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
-            var schema: named.Builder = .{ .gpa = gpa, .io = io, .pack = &m.pack, .metadata_only = true };
-            defer schema.deinit();
-            if (cache != null) {
-                try schema.top(&m.pl);
-                try schema.dspark(&m.pl);
-            }
-            if (cache == null or !try cache.?.get(&b, "top", schema.out.items)) {
-                try b.top(&m.pl);
-                try b.dspark(&m.pl);
-                if (cache) |*c| c.put(&b, "top") catch |e| if (!quiet) std.log.warn("dsv41 prepared: top not written ({t})", .{e});
-            }
-            const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
-            try m.weights.upload(&m.driver, &b);
-            t_build += t1 - t0;
-            t_upload += std.Io.Clock.awake.now(io).toNanoseconds() - t1;
+            const ms = struct {
+                fn of(ns: i96) f64 {
+                    return @as(f64, @floatFromInt(ns)) / 1e6;
+                }
+            }.of;
+            if (cache) |c| std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images, {d:.0} ms upload + digest), {d:.1} GiB; prepared {s}: {d} read ({d:.1} GiB in {d:.0} ms), {d} built, {d} written ({d:.0} ms)", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30), c.root, c.stats.hits, @as(f64, @floatFromInt(c.stats.read_bytes)) / (1 << 30), ms(c.stats.read_ns), c.stats.misses, c.stats.written, ms(c.stats.write_ns) }) else std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images from the pack, {d:.0} ms upload + digest), {d:.1} GiB; TF_DSV41_PREPARED unset", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30) });
         }
         @import("core").checkpoint.cache.files(io, m.pack.dir, m.pack.files.items);
-        const ms = struct {
-            fn of(ns: i96) f64 {
-                return @as(f64, @floatFromInt(ns)) / 1e6;
-            }
-        }.of;
-        if (cache) |c| std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images, {d:.0} ms upload + digest), {d:.1} GiB; prepared {s}: {d} read ({d:.1} GiB in {d:.0} ms), {d} built, {d} written ({d:.0} ms)", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30), c.root, c.stats.hits, @as(f64, @floatFromInt(c.stats.read_bytes)) / (1 << 30), ms(c.stats.read_ns), c.stats.misses, c.stats.written, ms(c.stats.write_ns) }) else std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images from the pack, {d:.0} ms upload + digest), {d:.1} GiB; TF_DSV41_PREPARED unset", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30) });
         tr.step("weights", cuda.usage(false));
         m.aot = try cuda.aot.Set.load(gpa, io, &m.driver, m.ctx.device, try std.fs.path.join(a, &.{ assets, asset_names.aot }));
         try @import("aot_trace.zig").attach(gpa, io, &m.aot, @import("aot_trace.zig").pathFromEnv());
-        m.widths = try gate_forward.widths(a, &m.weights, &m.pl);
+        m.widths = if (o.native_official) .{} else try gate_forward.widths(a, &m.weights, &m.pl);
         m.runner = .{ .gpa = gpa, .d = &m.driver, .stream = m.stream, .kernels = &m.kernels, .triton = &m.aot, .weights = &m.weights };
+        if (m.native) |*native| try native.bind(&m.runner);
         // TF_DSV41_PROFILE=<file>: the served engine's eager windows and prefill segments timed, JSON written at close
         m.runner.prof = if (try @import("profile.zig").Profile.fromEnv(gpa, &m.driver)) |p| p.timer() else null;
         const topp: ?f64 = if (std.c.getenv("TF_DSV41_EXPERT_TOPP")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else null;
         // TF_DSV41_R1=1, or the eight separate R1 knobs (the knob reader's r1)
         const r1 = @import("serve_knobs.zig").r1(&@import("serve_knobs.zig").env);
-        m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .rank = m.tcfg.rank, .expert_topp = topp, .r1 = r1, .taps = o.drafts }, &m.runner, comm);
+        m.f = fwd.Forward.init(gpa, &m.cfg, &m.widths, .{ .world = world, .rank = m.tcfg.rank, .expert_topp = topp, .r1 = r1, .taps = o.drafts, .native_mixed = o.native_official }, &m.runner, comm);
         try @import("engine_hooks.zig").open(&m.f); // the forward's later-layer hooks and prefill state
         m.f.layers = backbone;
         // the rope tables cover the limit + a prefill segment (the assets' rope.bin)
@@ -310,6 +342,7 @@ pub const Model = struct {
         }
         try @import("serve_knobs_apply.zig").apply(&m.f, a, io, m.tcfg.rank);
         m.slots = try slots_mod.countFromEnv();
+        if (o.native_official and m.slots != 1) return error.NativeOfficialNeedsOneSlot;
         if (try kvs.optionsFromEnv(@intCast(m.f.opts.limit), world)) |ko_| {
             var ko = ko_;
             ko.slots = m.slots;
@@ -344,26 +377,28 @@ pub const Model = struct {
             pf.state(&m.f).long.lazy = .{ .bytes = kv.value };
         };
         // TF_DSV41_EX_STACKS=1: the experts' suh / svh stacks read where the weights hold them (no second copy)
-        if (ex_stacks.enabled()) _ = try ex_stacks.bind(&m.runner, &m.weights, &bp);
+        if (!o.native_official and ex_stacks.enabled()) _ = try ex_stacks.bind(&m.runner, &m.weights, &bp);
         // TF_DSV41_FORMS_INPLACE=1: the dense forms over their trellis (not a second copy), unless a program reads it
-        if (forms_inplace.enabled()) {
+        if (!o.native_official and forms_inplace.enabled()) {
             const ws = &pf.state(&m.f).k4ws.plan;
             _ = try forms_inplace.bind(gpa, &m.runner, &m.weights, if (ws.*) |*w| &.{ &bp, w } else &.{&bp});
         }
         tr.plan(bp.totals());
         try m.runner.bind(&bp);
         tr.step("buffer plan", cuda.usage(false));
-        const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
-        for (bp.sizes.keys()) |role| {
-            if (buffers.scopeOf(role) != .persistent) continue;
-            var ra = std.heap.ArenaAllocator.init(gpa);
-            defer ra.deinit();
-            const bytes = (try forms.build(ra.allocator(), &src, role)) orelse continue;
-            try m.f.upload(m.runner.addressOf(role).?, bytes);
+        if (!o.native_official) {
+            const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
+            for (bp.sizes.keys()) |role| {
+                if (buffers.scopeOf(role) != .persistent) continue;
+                var ra = std.heap.ArenaAllocator.init(gpa);
+                defer ra.deinit();
+                const bytes = (try forms.build(ra.allocator(), &src, role)) orelse continue;
+                try m.f.upload(m.runner.addressOf(role).?, bytes);
+            }
         }
         tr.step("forms", cuda.usage(false));
         // TF_DSV41_L2PF: the prefetch tables from the bound weights and forms (the expert tables above), every rank
-        m.l2pf = try l2pf_mod.install(gpa, &m.f, &m.weights);
+        m.l2pf = if (o.native_official) null else try l2pf_mod.install(gpa, &m.f, &m.weights);
         // no size cap: a 1M limit + 2,048 rows is 538 MB
         const want: usize = @intCast(m.f.opts.rope_rows * 64 * 4);
         const RopeSink = struct {
@@ -507,6 +542,7 @@ pub const Model = struct {
             gpa.destroy(p);
         }
         m.runner.deinit();
+        if (m.native) |*native| native.deinit();
         m.aot.deinit();
         m.pl.deinit();
         m.pack.deinit();

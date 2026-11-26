@@ -69,9 +69,17 @@ pub fn moeRows(s: *Seg, L: u32, n: i64, x: Arg, comptime bias: []const u8, part:
             if (t >= @min(m, 16)) break t;
         } else 16;
         const cfg: [2]i64 = if (n <= 16) .{ 2, 0 } else if (m > 16) .{ 8, 2 } else .{ 8, 1 };
+        const gate = if (e.o.native_mixed)
+            try e.weight("layers.{d}.ffn.gate.weight", .{L}, .bf16, &.{ Et, D })
+        else
+            try e.weight("L{d}.moe.gate", .{L}, .bf16, &.{ Et, D });
+        const bias_weight = if (e.o.native_mixed)
+            try e.weight("layers.{d}.ffn.gate." ++ bias, .{L}, .f32, &.{Et})
+        else
+            try e.weight("L{d}.moe." ++ bias, .{L}, .f32, &.{Et});
         try e.ext("tf_dsv41_router_gemv_v2.route", &.{
-            if (whole) x else try rowsOf(e, x, .bf16, c0, m, D),        try e.weight("L{d}.moe.gate", .{L}, .bf16, &.{ Et, D }),
-            try e.weight("L{d}.moe." ++ bias, .{L}, .f32, &.{Et}),      if (whole) pick else try rowsOf(e, pick, .i32, c0, m, slots),
+            if (whole) x else try rowsOf(e, x, .bf16, c0, m, D),        gate,
+            bias_weight,                                                if (whole) pick else try rowsOf(e, pick, .i32, c0, m, slots),
             if (whole) wts else try rowsOf(e, wts, .f32, c0, m, slots), if (whole) logits else try rowsOf(e, logits, .f32, c0, m, Et),
             try e.buf("s.router.cnt", .{}, .i32, &.{128}),              .{ .i = topk },
             .{ .i = slots },                                            .{ .f = E.dec(e.cfg.routed_scale) },
@@ -89,6 +97,13 @@ pub fn moeRows(s: *Seg, L: u32, n: i64, x: Arg, comptime bias: []const u8, part:
             more[last.args.len] = .{ .arg = .{ .list = &.{} } };
             last.args = more;
         } else if (e.o.r1_sig) try e.appendLast(&.{.{ .list = &.{} }});
+    }
+    if (e.o.native_mixed) {
+        if (e.o.r1 or e.o.r1_sig or e.o.image_rows != 0) return error.UnsupportedNativeConfiguration;
+        const native_out = try e.buf("L.native.moe", .{}, .f32, &.{ n, D });
+        try @import("native_emit.zig").moe(e, L, x, pick, wts, native_out, n, slots, ex.count, D, I, E.dec(e.cfg.swiglu_limit));
+        try e.glue("moe_sum", &.{ native_out, part });
+        return;
     }
     // the kit's fp16 weights, the shared slot masked, the routed slots' contiguous copies
     const rs: i64 = if (n == 1) slots else topk;

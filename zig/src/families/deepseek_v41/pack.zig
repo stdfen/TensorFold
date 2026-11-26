@@ -35,6 +35,12 @@ pub const Pack = struct {
     dir: []const u8 = "",
     /// shards the index lists that the folder does not hold
     missing: u32 = 0,
+    /// Header tensors absent from an index. Existing EXL3 callers may ignore them;
+    /// strict official-checkpoint admission rejects them.
+    unindexed: u32 = 0,
+    /// Header tensors stored in a shard other than the index-declared owner.
+    misplaced: u32 = 0,
+    index_total_size: ?u64 = null,
     files: std.ArrayList([]const u8) = .empty,
     names: std.StringArrayHashMapUnmanaged(Info) = .empty,
     /// the index's weight map (name -> shard); when set, names another shard owns are skipped
@@ -106,6 +112,13 @@ pub const Pack = struct {
         if (parsed != .object) return error.BadIndex;
         const map = (parsed.object.get("weight_map") orelse return error.BadIndex);
         if (map != .object) return error.BadIndex;
+        if (parsed.object.get("metadata")) |metadata| {
+            if (metadata != .object) return error.BadIndex;
+            if (metadata.object.get("total_size")) |total| {
+                if (total != .integer or total.integer < 0) return error.BadIndex;
+                p.index_total_size = @intCast(total.integer);
+            }
+        }
         if (p.files.items.len != 0 or p.owner.count() != 0 or map.object.count() == 0) return error.BadIndex;
         var check = map.object.iterator();
         while (check.next()) |entry| {
@@ -144,8 +157,14 @@ pub const Pack = struct {
         while (it.next()) |e| {
             const v = e.value_ptr.*;
             if (p.owner.count() > 0) {
-                const f = p.owner.get(e.key_ptr.*) orelse continue;
-                if (!std.mem.eql(u8, f, file_name)) continue;
+                const f = p.owner.get(e.key_ptr.*) orelse {
+                    p.unindexed += 1;
+                    continue;
+                };
+                if (!std.mem.eql(u8, f, file_name)) {
+                    p.misplaced += 1;
+                    continue;
+                }
             }
             const gop = p.names.getOrPutAssumeCapacity(e.key_ptr.*);
             if (gop.found_existing) return error.DuplicateTensor;
@@ -180,6 +199,10 @@ pub const Pack = struct {
     pub const Projection = @import("projection.zig").Projection;
     pub fn projection(p: *const Pack, prefix: []const u8) !Projection {
         return @import("projection.zig").read(p, prefix);
+    }
+    pub const NativeProjection = @import("native_projection.zig").Projection;
+    pub fn nativeProjection(p: *const Pack, prefix: []const u8) !NativeProjection {
+        return @import("native_projection.zig").read(p, prefix);
     }
     /// Current CUDA rank adapter. Complete dense/packed storage remains available through projection().
     pub fn group(p: *const Pack, prefix: []const u8, buf: []u8) !exl3.Group {

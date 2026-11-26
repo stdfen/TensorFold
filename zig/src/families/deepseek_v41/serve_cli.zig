@@ -11,7 +11,15 @@ fn drafts() bool {
 }
 
 pub fn follow(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []const u8) !u8 {
-    const m = try model.Model.open(gpa, io, pack, assets, .{ .drafts = drafts(), .own_prefill = model.ownPrefillEnv(), .layers = try model.layersEnv(gpa) });
+    const use_drafts = drafts();
+    const native_official = model.nativeOfficialEnv();
+    if (native_official and use_drafts) return error.NativeOfficialDraftsDisabled;
+    const m = try model.Model.open(gpa, io, pack, assets, .{
+        .drafts = use_drafts,
+        .own_prefill = model.ownPrefillEnv(),
+        .layers = try model.layersEnv(gpa),
+        .native_official = native_official,
+    });
     defer m.close();
     if (m.rank() == 0) return error.RankZeroServes;
     std.debug.print("rank {d}: loaded, following rank 0\n", .{m.rank()});

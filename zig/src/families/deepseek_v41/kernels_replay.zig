@@ -186,6 +186,8 @@ pub fn call(k: *const Kernels, s: cuda.Stream, ext: []const u8, func: []const u8
         return true;
     }
     if (is(ext, "tensorfold_exl3_linear_v4")) return linearExt(k.linears(s), func, args, kwargs);
+    if (is(ext, "tf_dsv41_native_mixed_v1")) return nativeExt(k.nativeMixed(s), func, args, kwargs);
+    if (is(ext, "tf_dsv41_native_moe_v1")) return nativeMoeExt(k.nativeMoe(s), func, args, kwargs);
     if (is(ext, "tf_dsv41_x3seg_v3")) return segExt(k.linears(s), func, args, kwargs, false);
     if (is(ext, "tf_dsv41_dense3_v1")) return segExt(k.linears(s), func, args, kwargs, true);
     if (is(ext, "tensorfold_exl3_experts_v1")) return expertsExt(k.experts(s), func, args, kwargs);
@@ -202,6 +204,110 @@ pub fn call(k: *const Kernels, s: cuda.Stream, ext: []const u8, func: []const u8
     if (is(ext, "tf_dsv41_l2pace_v1") and is(func, "paced")) return paced(k.others(s), args, kwargs);
     if (is(ext, "tf_dsv41_l2pf_v1") and is(func, "segments")) return segments(k.others(s), args, kwargs);
     return false; // engram_gate.gate_copy reads host-mapped words a capture cannot relocate: not replayed
+}
+
+fn nativeExt(native_ops: anytype, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
+    const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "weight", "scale", "out", "dynamic", "wo_rank" } };
+    const x = try c.tensor(0);
+    const weight = try c.tensor(1);
+    const out = try c.tensor(3);
+    if (x.dtype != .bf16 or x.shape.len != 2 or weight.shape.len != 2 or (out.dtype != .f32 and out.dtype != .bf16) or out.shape.len != 2)
+        return error.WrongArgument;
+    const out_bf16 = out.dtype == .bf16;
+    const rows = try dim(x, 0);
+    const n = try dim(weight, 0);
+    if (try dim(out, 0) != rows or try dim(out, 1) != n) return error.WrongArgument;
+    if (is(func, "bf16")) {
+        if (weight.dtype != .bf16 or try dim(x, 1) != try dim(weight, 1)) return error.WrongArgument;
+        if (out_bf16) try native_ops.bf16To(x.ptr, weight.ptr, out.ptr, rows, n, try dim(weight, 1), true) else try native_ops.bf16(x.ptr, weight.ptr, out.ptr, rows, n, try dim(weight, 1));
+        return true;
+    }
+    const scale = try c.tensor(2);
+    if (scale.dtype != .u8 or scale.shape.len != 2) return error.WrongArgument;
+    if (is(func, "mxfp8")) {
+        const k = try dim(weight, 1);
+        if (weight.dtype != .u8 or try dim(x, 1) != k or try dim(scale, 0) != divCeil(n, 32) or try dim(scale, 1) != divCeil(k, 32)) return error.WrongArgument;
+        const dynamic = try c.boolean(4, true);
+        if (out_bf16) try native_ops.mxfp8To(x.ptr, weight.ptr, scale.ptr, out.ptr, rows, n, k, dynamic, true) else try native_ops.mxfp8(x.ptr, weight.ptr, scale.ptr, out.ptr, rows, n, k, dynamic);
+        return true;
+    }
+    if (is(func, "mxfp4")) {
+        const k = 2 * try dim(weight, 1);
+        if (weight.dtype != .i8 or try dim(x, 1) != k or try dim(scale, 0) != n or try dim(scale, 1) != k / 32) return error.WrongArgument;
+        if (out_bf16) try native_ops.mxfp4To(x.ptr, weight.ptr, scale.ptr, out.ptr, rows, n, k, true) else try native_ops.mxfp4(x.ptr, weight.ptr, scale.ptr, out.ptr, rows, n, k);
+        return true;
+    }
+    if (is(func, "wo_a")) {
+        const k = try dim(weight, 1);
+        const rank = try c.usz(5);
+        if (weight.dtype != .u8 or rank == 0 or n % rank != 0 or try dim(x, 1) != k or try dim(scale, 0) != divCeil(n, 32) or try dim(scale, 1) != divCeil(k, 32)) return error.WrongArgument;
+        if (out_bf16) try native_ops.woATo(x.ptr, weight.ptr, scale.ptr, out.ptr, rows, n / rank, rank, k, true) else try native_ops.woA(x.ptr, weight.ptr, scale.ptr, out.ptr, rows, n / rank, rank, k);
+        return true;
+    }
+    return false;
+}
+
+fn divCeil(value: usize, divisor: usize) usize {
+    return value / divisor + @intFromBool(value % divisor != 0);
+}
+
+fn nativeMoeExt(native_ops: anytype, func: []const u8, args: []const Arg, kwargs: []const Kw) !bool {
+    if (is(func, "gateup")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "x", "pick", "w1", "s1", "w3", "s3", "kinds", "act", "rows", "slots", "experts", "hidden", "width", "limit" } };
+        const x = try c.tensor(0);
+        const pick = try c.tensor(1);
+        const act = try c.tensor(7);
+        if (x.dtype != .bf16 or pick.dtype != .i32 or act.dtype != .bf16) return error.WrongArgument;
+        const p: @import("native_moe_kernels.zig").Ops.Plan = .{
+            .rows = try c.usz(8), .slots = try c.usz(9), .experts = try c.usz(10), .hidden = try c.usz(11), .width = try c.usz(12),
+        };
+        try native_ops.gateup(x.ptr, pick.ptr, try c.ptr(2), try c.ptr(3), try c.ptr(4), try c.ptr(5), try c.ptr(6), act.ptr, p, @floatCast(try c.float(13)));
+        return true;
+    }
+    if (is(func, "down")) {
+        const c: Call = .{ .args = args, .kwargs = kwargs, .names = &.{ "act", "pick", "route", "w2", "s2", "kinds", "out", "rows", "slots", "experts", "hidden", "width" } };
+        const act = try c.tensor(0);
+        const pick = try c.tensor(1);
+        const route_w = try c.tensor(2);
+        const out = try c.tensor(6);
+        if (act.dtype != .bf16 or pick.dtype != .i32 or route_w.dtype != .f32 or out.dtype != .f32) return error.WrongArgument;
+        const p: @import("native_moe_kernels.zig").Ops.Plan = .{
+            .rows = try c.usz(7), .slots = try c.usz(8), .experts = try c.usz(9), .hidden = try c.usz(10), .width = try c.usz(11),
+        };
+        try native_ops.down(act.ptr, pick.ptr, route_w.ptr, try c.ptr(3), try c.ptr(4), try c.ptr(5), out.ptr, p);
+        return true;
+    }
+    return false;
+}
+
+test "official mixed replay dispatch validates packed MXFP4 geometry" {
+    const Mock = struct {
+        seen: *[3]usize,
+        pub fn bf16(_: @This(), _: u64, _: u64, _: u64, _: usize, _: usize, _: usize) !void {}
+        pub fn bf16To(_: @This(), _: u64, _: u64, _: u64, _: usize, _: usize, _: usize, _: bool) !void {}
+        pub fn mxfp8(_: @This(), _: u64, _: u64, _: u64, _: u64, _: usize, _: usize, _: usize, _: bool) !void {}
+        pub fn mxfp8To(_: @This(), _: u64, _: u64, _: u64, _: u64, _: usize, _: usize, _: usize, _: bool, _: bool) !void {}
+        pub fn mxfp4(m: @This(), _: u64, _: u64, _: u64, _: u64, rows: usize, n: usize, k: usize) !void {
+            m.seen.* = .{ rows, n, k };
+        }
+        pub fn mxfp4To(_: @This(), _: u64, _: u64, _: u64, _: u64, _: usize, _: usize, _: usize, _: bool) !void {}
+        pub fn woA(_: @This(), _: u64, _: u64, _: u64, _: u64, _: usize, _: usize, _: usize, _: usize) !void {}
+        pub fn woATo(_: @This(), _: u64, _: u64, _: u64, _: u64, _: usize, _: usize, _: usize, _: usize, _: bool) !void {}
+    };
+    const x_shape = [_]i64{ 2, 32 };
+    const w_shape = [_]i64{ 4, 16 };
+    const s_shape = [_]i64{ 4, 1 };
+    const o_shape = [_]i64{ 2, 4 };
+    const stride = [_]i64{ 1, 1 };
+    const args = [_]Arg{
+        .{ .tensor = .{ .ptr = 1, .dtype = .bf16, .shape = &x_shape, .stride = &stride } },
+        .{ .tensor = .{ .ptr = 2, .dtype = .i8, .shape = &w_shape, .stride = &stride } },
+        .{ .tensor = .{ .ptr = 3, .dtype = .u8, .shape = &s_shape, .stride = &stride } },
+        .{ .tensor = .{ .ptr = 4, .dtype = .f32, .shape = &o_shape, .stride = &stride } },
+    };
+    var seen: [3]usize = undefined;
+    try std.testing.expect(try nativeExt(Mock{ .seen = &seen }, "mxfp4", &args, &.{}));
+    try std.testing.expectEqual([3]usize{ 2, 4, 32 }, seen);
 }
 
 const linearExt = replay_experts.linearExt;

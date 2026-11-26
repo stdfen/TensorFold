@@ -9,6 +9,8 @@ pub const dense = @import("cuda").qlinear.block.dense;
 pub const kv_glue = @import("kernels_kv_glue.zig");
 pub const replay = @import("kernels_replay.zig");
 pub const ops = @import("kernels_ops.zig");
+pub const native = @import("native_kernels.zig");
+pub const native_moe = @import("native_moe_kernels.zig");
 /// sampling.cu (its own module, loaded by the keyed sampler)
 pub const sampling = @import("sampling_kernels.zig");
 
@@ -53,6 +55,8 @@ pub const images = struct {
     pub const router_glue: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_router_glue").bytes else &.{};
     pub const x3ld_epi: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_x3ld_epi").bytes else &.{};
     pub const topk_b: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_topk_b").bytes else &.{};
+    pub const native_mixed: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_native_mixed").bytes else &.{};
+    pub const native_moe: []const u8 = if (available) &Blob("dsv41_fatbin_dsv41_native_moe").bytes else &.{};
 };
 
 /// lin2.cu (ours, TF_DSV41_LIN2): optional (zig/build/cuda.zig), an empty image when the build has none.
@@ -67,11 +71,13 @@ fn env(name: [:0]const u8) ?[]const u8 {
 }
 
 pub const Kernels = struct {
-    mods: [30]cuda.Module,
+    mods: [32]cuda.Module,
     kv_glue: kv_glue.Functions,
     exl3: exl3.Functions,
     dense: dense.Functions,
     ops: ops.Functions,
+    native: native.Functions,
+    native_moe: native_moe.Functions,
     sms: usize,
 
     /// Loads every module and resolves every instance the launches can use.
@@ -80,7 +86,7 @@ pub const Kernels = struct {
         if (!available) return error.BuiltWithoutKernels;
         const d = ctx.d;
         var k: Kernels = undefined;
-        const list = [_][]const u8{ images.exl3_experts, images.x3ld, images.x3pf, images.x3gm, images.linear, images.x3seg, images.dense3, images.attn, images.topk, images.mhc, images.mhc_pf, images.router_gemv, images.pfdense_k8, images.pfdense_k10, images.pfdense_k12, images.pfdense_k16, images.engram_gate, images.l2pace, images.l2pf, images.x3gm_plan, images.topk_keys, images.pointwise, images.kvsplit, images.glue, images.x3gm3, images.pfglue, images.router_glue, images.kv_glue, images.x3ld_epi, images.topk_b };
+        const list = [_][]const u8{ images.exl3_experts, images.x3ld, images.x3pf, images.x3gm, images.linear, images.x3seg, images.dense3, images.attn, images.topk, images.mhc, images.mhc_pf, images.router_gemv, images.pfdense_k8, images.pfdense_k10, images.pfdense_k12, images.pfdense_k16, images.engram_gate, images.l2pace, images.l2pf, images.x3gm_plan, images.topk_keys, images.pointwise, images.kvsplit, images.glue, images.x3gm3, images.pfglue, images.router_glue, images.kv_glue, images.x3ld_epi, images.topk_b, images.native_mixed, images.native_moe };
         comptime std.debug.assert(list.len == @typeInfo(@FieldType(Kernels, "mods")).array.len);
         var loaded: usize = 0;
         errdefer for (k.mods[0..loaded]) |*m| m.unload();
@@ -95,6 +101,8 @@ pub const Kernels = struct {
         k.dense = try dense.Functions.resolve(k.mods[4], k.mods[5], k.mods[6]);
         const m = k.mods;
         k.ops = try ops.Functions.resolve(m[7], m[8], m[9], m[10], m[11], .{ m[12], m[13], m[14], m[15] }, m[16], m[17], m[18], m[20], m[21], m[22], m[23], m[25], m[29], optin);
+        k.native = try native.Functions.resolve(m[30]);
+        k.native_moe = try native_moe.Functions.resolve(m[31]);
         k.sms = @intCast(try ctx.attribute(.multiprocessor_count));
         try k.loadLin2(d, blk: {
             var lm = try dense.lin2ModeWk(env("TF_DSV41_LIN2"), env("TF_DSV41_LIN2_PF"), env("TF_DSV41_LIN2_WK"));
@@ -138,6 +146,14 @@ pub const Kernels = struct {
     pub fn linears(k: *const Kernels, s: cuda.Stream) dense.Ops {
         return .{ .f = &k.dense, .s = s };
     }
+
+    pub fn nativeMixed(k: *const Kernels, s: cuda.Stream) native.Ops {
+        return .{ .f = &k.native, .stream = s };
+    }
+
+    pub fn nativeMoe(k: *const Kernels, s: cuda.Stream) native_moe.Ops {
+        return .{ .f = &k.native_moe, .stream = s };
+    }
 };
 
 test {
@@ -154,6 +170,9 @@ test {
     std.testing.refAllDecls(ops);
     std.testing.refAllDecls(ops.Ops);
     std.testing.refAllDecls(ops.Functions);
+    std.testing.refAllDecls(native);
+    std.testing.refAllDecls(native.Ops);
+    std.testing.refAllDecls(native_moe.Ops);
 }
 
 test {

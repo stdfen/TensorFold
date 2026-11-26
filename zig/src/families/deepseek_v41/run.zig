@@ -6,6 +6,7 @@ const dk = @import("dsv41_kernels");
 const calls = @import("block_calls.zig");
 const buffers = @import("buffers.zig");
 const load = @import("cuda_weights.zig");
+const native_load = @import("native_cuda_weights.zig");
 const tc = @import("triton_call.zig");
 const rp = dk.replay;
 
@@ -53,7 +54,9 @@ pub const Runner = struct {
     stream: cuda.Stream,
     kernels: *const dk.Kernels,
     triton: *const cuda.aot.Set,
-    weights: *const load.Weights,
+    weights: ?*const load.Weights = null,
+    /// Lossless official safetensors image used by the native mixed path.
+    native_weights: ?*const native_load.Weights = null,
     /// role -> device address
     addrs: std.StringHashMapUnmanaged(u64) = .empty,
     owned: std.ArrayList(cuda.DeviceBuffer) = .empty,
@@ -180,13 +183,24 @@ pub const Runner = struct {
         return r.addrs.get(role);
     }
 
+    pub const WeightView = struct { ptr: u64, len: usize };
+
+    /// A named weight through either the legacy packed loader or the lossless official loader.
+    pub fn weightView(r: *const Runner, role: []const u8) ?WeightView {
+        if (r.native_weights) |weights| if (weights.get(role)) |tensor| return .{ .ptr = tensor.ptr, .len = tensor.len };
+        if (r.weights) |weights| if (weights.get(role)) |tensor| return .{ .ptr = tensor.ptr, .len = tensor.len };
+        return null;
+    }
+
     pub fn tensorAddr(r: *const Runner, t: calls.Tensor) !u64 {
         var numel: i64 = 1;
         for (t.shape) |n| numel *= n;
         if (numel == 0) return 0;
         const off: u64 = @intCast(t.offset);
         return switch (t.role) {
-            .weight => |w| (r.weights.get(w) orelse return error.MissingWeight).ptr + off,
+            .weight => |w| blk: {
+                break :blk (r.weightView(w) orelse return error.MissingWeight).ptr + off;
+            },
             .buf => |b| (r.addrs.get(b) orelse return error.Unbound) + off,
             .empty => error.EmptyRole,
         };

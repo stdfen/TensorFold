@@ -54,7 +54,7 @@ pub fn glueFn(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!vo
         return r.d.check(r.d.api.cuMemsetD32Async(lo, 0, R, s), "cuMemsetD32Async");
     }
     if (std.mem.eql(u8, step, "embed")) {
-        const embed = r.weights.get("embed") orelse return error.MissingWeight;
+        const embed = r.weightView("embed") orelse return error.MissingWeight;
         const vocab_part = try @import("partition.zig").share(f.cfg.vocab, f.comm.rank(), W);
         const V: usize = vocab_part.len;
         const rows = try f.sendBuffer(r, 2 * R * D);

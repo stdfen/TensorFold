@@ -121,6 +121,10 @@ pub const Seg = struct {
     pub fn matmul(s: *Seg, w: []const u8, form: Form, x: Arg, k: i64, n: i64, y: Out) !void {
         const e = s.e;
         const m = e.n;
+        if (e.o.native_mixed) {
+            const out = try e.view(y.role, y.dt, &.{ m, n }, &.{ y.stride, 1 }, y.offset);
+            return @import("native_emit.zig").projection(e, w, x, out, k, n);
+        }
         const k2: i64 = try e.w.k2(w);
         const tw = 4 * k2;
         const nb = @divExact(n, 128);

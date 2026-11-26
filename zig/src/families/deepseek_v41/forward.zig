@@ -297,6 +297,7 @@ pub const Forward = struct {
 
     pub const greedy = fwd_sample.greedy;
     pub const greedyScratch = fwd_sample.greedyScratch;
+    pub const captureTopK = fwd_sample.captureTopK;
 
     /// The last window's pick on the device: `out` int64 [n + 3] = picks, then (chain) accepted, bonus, next position.
     pub const PickDevice = struct { out: u64, n: u32, chain: bool, start: u64 = 0, host: ?[*]const i64 = null };

@@ -157,9 +157,17 @@ pub fn moe(e: *E, L: u32) !void {
     // the route groups in its tail only on the narrow kernel (<= 16 rows) and GE <= 512; else upstream's group follows
     const grouped = fold and rc[2] == 0 and Et <= 512;
     const scale: f64 = E.dec(e.cfg.routed_scale);
+    const gate = if (e.o.native_mixed)
+        try e.weight("layers.{d}.ffn.gate.weight", .{L}, .bf16, &.{ ex.count, D })
+    else
+        try e.weight("L{d}.moe.gate", .{L}, .bf16, &.{ ex.count, D });
+    const bias = if (e.o.native_mixed)
+        try e.weight("layers.{d}.ffn.gate.bias", .{L}, .f32, &.{ex.count})
+    else
+        try e.weight("L{d}.moe.bias", .{L}, .f32, &.{ex.count});
     try e.ext("tf_dsv41_router_gemv_v2.route", &.{
-        x,                                                       try e.weight("L{d}.moe.gate", .{L}, .bf16, &.{ ex.count, D }),
-        try e.weight("L{d}.moe.bias", .{L}, .f32, &.{ex.count}), pick,
+        x,                                                       gate,
+        bias,                                                    pick,
         wts,                                                     try e.buf("L.logits", .{}, .f32, &.{ n, ex.count }),
         try e.buf("s.router.cnt", .{}, .i32, &.{128}),           .{ .i = ex.topk },
         .{ .i = slots },                                         .{ .f = scale },
@@ -198,6 +206,13 @@ pub fn moe(e: *E, L: u32) !void {
             last.args = more;
         }
         try e.glue("kit_weights", &.{ wts, try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) });
+    }
+    if (e.o.native_mixed) {
+        if (!backbone or e.o.r1 or e.o.r1_sig) return error.UnsupportedNativeConfiguration;
+        const route_w = if (!fold) try e.buf("L.wts16", .{}, .f32, &.{ n, slots }) else wts;
+        const out = try e.buf("L.moe", .{}, .f32, &.{ n, D });
+        try @import("native_emit.zig").moe(e, L, x, pick, route_w, out, n, slots, ex.count, D, I, E.dec(e.cfg.swiglu_limit));
+        return;
     }
     const group_rot = !grouped and e.o.router_group_rot and n <= 64 and slots <= 9 and Et <= 512 and D == 5120;
     if (!grouped and !group_rot) try e.ext("tensorfold_exl3_experts_v1.group", &.{ pick, uids, ucount, members, .{ .i = n }, .{ .i = slots }, .{ .i = Et } });

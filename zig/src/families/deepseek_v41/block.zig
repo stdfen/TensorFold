@@ -29,6 +29,8 @@ pub const Widths = struct {
 
 /// Run-time sizes fixed at load (scratch and pools), and the L2 prefetch settings.
 pub const Options = struct {
+    /// Official safetensors arithmetic and names; false keeps the existing EXL3 path unchanged.
+    native_mixed: bool = false,
     /// TF_DSV41_IMAGES=native: this prefill segment holds image positions, so Engram fuses with a keep vector
     image_keep: bool = false,
     /// TF_DSV41_BIAS_VL: the segment's image rows (MoE call apart, gate.bias_vl); 0: none; < 0: the buffer plan's
@@ -317,6 +319,11 @@ pub const Emitter = struct {
     }
 
     pub fn fusedNorm(e: *Emitter, tag: []const u8, ps: []const Proj, norm: ?Norm) !void {
+        if (e.o.native_mixed) {
+            if (norm != null) return error.UnsupportedNativeConfiguration;
+            for (ps) |p| try @import("native_emit.zig").projection(e, p.w, p.x, p.y, @intCast(p.k), @intCast(p.n));
+            return;
+        }
         const m: usize = @intCast(e.n);
         const segs = try e.a.alloc(dense.Seg, ps.len);
         for (ps, segs, 0..) |p, *s, i| {
@@ -364,6 +371,7 @@ pub const Emitter = struct {
 
     /// Upstream's rot_in + linear: one projection, its trellis as strips unless one 128-column block.
     pub fn upstream(e: *Emitter, w: []const u8, x: Arg, k: i64, n: i64, y: Arg) !void {
+        if (e.o.native_mixed) return @import("native_emit.zig").projection(e, w, x, y, k, n);
         const k2: i64 = try e.w.k2(w);
         const xh = try e.buf("L.{s}.xh", .{w}, .f16, &.{ e.n, k });
         try e.ext("tensorfold_exl3_linear_v4.rot_in", &.{ x, try e.weight("{s}.suh", .{w}, .f16, &.{k}), xh });

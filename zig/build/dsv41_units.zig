@@ -30,6 +30,8 @@ pub const units = [_]cuda_build.Kernel{
     .{ .name = "dsv41_kv_glue", .src = "deepseek_v41/kv_glue", .flags = &.{"-O3"} }, // KV RMS in rounded FP64; store keeps Triton's FMA
     .{ .name = "dsv41_x3ld_epi", .src = "exl3_block/x3ld_epi", .flags = &.{"-O3"} }, // ours: x3ld + the expert epilogues
     .{ .name = "dsv41_topk_b", .src = "deepseek_v41/topk_b", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false" } }, // ours: topk_cuda.cu row-bounded
+    .{ .name = "dsv41_native_mixed", .src = "deepseek_v41/native_mixed", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false" } },
+    .{ .name = "dsv41_native_moe", .src = "deepseek_v41/native_moe", .min_sm = 90, .flags = &.{ "-O3", "--fmad=false" } },
 };
 
 /// Optional images: the keyed sampler (TF_DSV41_SAMPLING) and two-tile linears (TF_DSV41_LIN2); empty, they refuse.
